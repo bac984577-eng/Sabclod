@@ -1,0 +1,506 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/assets/fonts
+          cat > settings.gradle.kts <<'ENDOFFILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ArabicWhiteboard"
+          include(":app")
+          ENDOFFILE
+          cat > build.gradle.kts <<'ENDOFFILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          ENDOFFILE
+          cat > gradle.properties <<'ENDOFFILE'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          ENDOFFILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'ENDOFFILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.arabicboard"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.arabicboard"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("com.google.mlkit:digital-ink-recognition:18.1.0")
+          }
+          ENDOFFILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:label="سبورة عربية"
+                  android:icon="@android:drawable/ic_menu_edit"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="floating whiteboard overlay" />
+                  </service>
+
+                  <service
+                      android:name=".TypeService"
+                      android:exported="true"
+                      android:label="سبورة عربية - الإدخال"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          ENDOFFILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100" />
+          ENDOFFILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'ENDOFFILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="acc_desc">يسمح للسبورة بإدراج النص المعرَّف داخل مربع النص في التطبيق الذي تكتب فيه.</string>
+          </resources>
+          ENDOFFILE
+          mkdir -p app/src/main/java/com/arabicboard
+          cat > app/src/main/java/com/arabicboard/TypeService.kt <<'ENDOFFILE'
+          package com.arabicboard
+
+          import android.accessibilityservice.AccessibilityService
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class TypeService : AccessibilityService() {
+              override fun onServiceConnected() { instance = this }
+              override fun onUnbind(intent: android.content.Intent?): Boolean { instance = null; return super.onUnbind(intent) }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              /** يضيف النص إلى مربع النص الذي عليه التركيز. يعيد false إذا لم يوجد. */
+              fun insert(text: String): Boolean {
+                  val node = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+                  val old = if (node.isShowingHintText) "" else (node.text?.toString() ?: "")
+                  val sep = if (old.isEmpty() || old.endsWith(" ") || old.endsWith("\n")) "" else " "
+                  val args = Bundle().apply {
+                      putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, old + sep + text)
+                  }
+                  return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+              }
+
+              companion object { var instance: TypeService? = null }
+          }
+          ENDOFFILE
+          mkdir -p app/src/main/java/com/arabicboard
+          cat > app/src/main/java/com/arabicboard/InkView.kt <<'ENDOFFILE'
+          package com.arabicboard
+
+          import android.content.Context
+          import android.graphics.*
+          import android.view.MotionEvent
+          import android.view.View
+          import com.google.mlkit.vision.digitalink.Ink
+
+          class InkView(ctx: Context) : View(ctx) {
+              var penColor = Color.parseColor("#1E40AF")
+              var onStrokeStart: (() -> Unit)? = null
+              var onStrokeEnd: (() -> Unit)? = null
+
+              private class Seg(val path: Path, val paint: Paint)
+              private val segs = mutableListOf<Seg>()
+              private var ink = Ink.builder()
+              private var stroke: Ink.Stroke.Builder? = null
+              private var path = Path()
+              private var lx = 0f
+              private var ly = 0f
+
+              private fun newPaint() = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = penColor; style = Paint.Style.STROKE; strokeWidth = 7f
+                  strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+              }
+
+              fun getInk(): Ink = ink.build()
+              fun hasInk() = segs.isNotEmpty()
+
+              fun clear() {
+                  segs.clear(); ink = Ink.builder(); stroke = null; invalidate()
+              }
+
+              override fun onDraw(c: Canvas) {
+                  c.drawColor(Color.WHITE)
+                  // خطوط خفيفة مثل الدفتر
+                  val g = Paint().apply { color = Color.parseColor("#EEF1F6"); strokeWidth = 2f }
+                  var y = 90f
+                  while (y < height) { c.drawLine(0f, y, width.toFloat(), y, g); y += 90f }
+                  segs.forEach { c.drawPath(it.path, it.paint) }
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val x = e.x; val y = e.y; val t = e.eventTime
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          parent.requestDisallowInterceptTouchEvent(true)
+                          onStrokeStart?.invoke()
+                          path = Path().apply { moveTo(x, y) }
+                          segs.add(Seg(path, newPaint()))
+                          stroke = Ink.Stroke.builder().apply { addPoint(Ink.Point.create(x, y, t)) }
+                          lx = x; ly = y
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          for (i in 0 until e.historySize) {
+                              stroke?.addPoint(Ink.Point.create(e.getHistoricalX(i), e.getHistoricalY(i), e.getHistoricalEventTime(i)))
+                          }
+                          stroke?.addPoint(Ink.Point.create(x, y, t))
+                          path.quadTo(lx, ly, (x + lx) / 2, (y + ly) / 2)
+                          lx = x; ly = y
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                          stroke?.addPoint(Ink.Point.create(x, y, t))
+                          path.lineTo(x, y)
+                          stroke?.let { ink.addStroke(it.build()) }
+                          stroke = null
+                          onStrokeEnd?.invoke()
+                      }
+                  }
+                  invalidate()
+                  return true
+              }
+          }
+          ENDOFFILE
+          mkdir -p app/src/main/java/com/arabicboard
+          cat > app/src/main/java/com/arabicboard/OverlayService.kt <<'ENDOFFILE'
+          package com.arabicboard
+
+          import android.app.*
+          import android.content.*
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.os.*
+          import android.view.*
+          import android.widget.*
+          import com.google.mlkit.common.model.DownloadConditions
+          import com.google.mlkit.common.model.RemoteModelManager
+          import com.google.mlkit.vision.digitalink.*
+
+          class OverlayService : Service() {
+              private lateinit var wm: WindowManager
+              private lateinit var root: LinearLayout
+              private lateinit var lp: WindowManager.LayoutParams
+              private lateinit var ink: InkView
+              private lateinit var preview: TextView
+              private var recognizer: DigitalInkRecognizer? = null
+              private var ready = false
+              private var lastText = ""
+              private val h = Handler(Looper.getMainLooper())
+              private val recognizeRun = Runnable { recognize() }
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  startForegroundCompat()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  buildUi()
+                  setupRecognizer()
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun startForegroundCompat() {
+                  val ch = "board"
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(ch, "السبورة", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(this, 0,
+                      Intent(this, OverlayService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE)
+                  val n = Notification.Builder(this, ch)
+                      .setSmallIcon(android.R.drawable.ic_menu_edit)
+                      .setContentTitle("السبورة العائمة تعمل")
+                      .addAction(Notification.Action.Builder(null, "إيقاف", stop).build())
+                      .build()
+                  startForeground(1, n)
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i?.action == "STOP") stopSelf()
+                  return START_STICKY
+              }
+
+              private fun loadFont(): Typeface? = try {
+                  Typeface.createFromAsset(assets, "fonts/arabic.ttf")
+              } catch (e: Exception) { null }
+
+              private fun btn(label: String, bg: String, onClick: () -> Unit) = TextView(this).apply {
+                  text = label; setTextColor(Color.WHITE); textSize = 15f; gravity = Gravity.CENTER
+                  setPadding(dp(14), dp(8), dp(14), dp(8))
+                  background = GradientDrawable().apply { cornerRadius = dp(18).toFloat(); setColor(Color.parseColor(bg)) }
+                  setOnClickListener { onClick() }
+              }
+
+              private fun buildUi() {
+                  root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                      background = GradientDrawable().apply {
+                          setColor(Color.WHITE); cornerRadius = dp(16).toFloat()
+                          setStroke(dp(2), Color.parseColor("#C7D2FE"))
+                      }
+                      elevation = dp(12).toFloat()
+                      clipToOutline = true
+                  }
+                  // الشريط العلوي: ألوان + سحب + إغلاق
+                  val bar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                      setBackgroundColor(Color.parseColor("#EEF2FF")); setPadding(dp(10), dp(6), dp(10), dp(6))
+                  }
+                  val colors = listOf("#1E40AF", "#DC2626", "#16A34A", "#EA580C", "#7C3AED", "#000000")
+                  ink = InkView(this)
+                  colors.forEach { c ->
+                      val dot = View(this).apply {
+                          background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor(c)) }
+                          setOnClickListener { ink.penColor = Color.parseColor(c) }
+                      }
+                      bar.addView(dot, LinearLayout.LayoutParams(dp(28), dp(28)).apply { marginEnd = dp(10) })
+                  }
+                  bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+                  bar.addView(TextView(this).apply {
+                      text = "✥"; textSize = 22f; setPadding(dp(10), 0, dp(10), 0)
+                  })
+                  bar.addView(TextView(this).apply {
+                      text = "✕"; textSize = 20f; setTextColor(Color.parseColor("#DC2626")); setPadding(dp(10), 0, dp(4), 0)
+                      setOnClickListener { stopSelf() }
+                  })
+                  dragBy(bar) { dx, dy -> lp.x += dx; lp.y += dy }
+                  root.addView(bar)
+
+                  // معاينة النص بالخط الواضح
+                  preview = TextView(this).apply {
+                      textSize = 24f; setTextColor(Color.parseColor("#111827")); gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                      setPadding(dp(14), dp(6), dp(14), dp(6)); minHeight = dp(48)
+                      text = "اكتب بيدك هنا…"
+                      loadFont()?.let { typeface = it }
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  }
+                  root.addView(preview, LinearLayout.LayoutParams(-1, -2))
+
+                  ink.onStrokeStart = { h.removeCallbacks(recognizeRun) }
+                  ink.onStrokeEnd = { h.postDelayed(recognizeRun, 900) }
+                  root.addView(ink, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  // الأزرار السفلية
+                  val bottom = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(10), dp(6), dp(10), dp(6)); setBackgroundColor(Color.parseColor("#F8FAFC"))
+                  }
+                  bottom.addView(btn("إدراج ✓", "#16A34A") { insertText() })
+                  bottom.addView(btn("مسح", "#64748B") { clearAll() },
+                      LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(8) })
+                  bottom.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+                  val grip = TextView(this).apply { text = "◢"; textSize = 26f; setTextColor(Color.parseColor("#94A3B8")); setPadding(dp(12), 0, dp(4), 0) }
+                  dragBy(grip) { dx, dy ->
+                      lp.width = (lp.width + dx).coerceAtLeast(dp(260))
+                      lp.height = (lp.height + dy).coerceAtLeast(dp(300))
+                  }
+                  bottom.addView(grip)
+                  root.addView(bottom)
+
+                  lp = WindowManager.LayoutParams(
+                      dp(340), dp(460),
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = dp(20); y = dp(120) }
+                  wm.addView(root, lp)
+              }
+
+              private fun dragBy(v: View, apply: (Int, Int) -> Unit) {
+                  var px = 0f; var py = 0f
+                  v.setOnTouchListener { view, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> { px = e.rawX; py = e.rawY }
+                          MotionEvent.ACTION_MOVE -> {
+                              apply((e.rawX - px).toInt(), (e.rawY - py).toInt()); px = e.rawX; py = e.rawY
+                              wm.updateViewLayout(root, lp)
+                          }
+                          MotionEvent.ACTION_UP -> view.performClick()
+                      }
+                      true
+                  }
+              }
+
+              private fun setupRecognizer() {
+                  val id = DigitalInkRecognitionModelIdentifier.fromLanguageTag("ar") ?: return
+                  val model = DigitalInkRecognitionModel.builder(id).build()
+                  recognizer = DigitalInkRecognition.getClient(DigitalInkRecognizerOptions.builder(model).build())
+                  preview.text = "جارٍ تحميل نموذج العربية (مرة واحدة، يلزم إنترنت)…"
+                  RemoteModelManager.getInstance().download(model, DownloadConditions.Builder().build())
+                      .addOnSuccessListener { ready = true; preview.text = "اكتب بيدك هنا…" }
+                      .addOnFailureListener { preview.text = "فشل تحميل النموذج، تأكد من الإنترنت" }
+              }
+
+              private fun recognize() {
+                  if (!ready || !ink.hasInk()) return
+                  recognizer?.recognize(ink.getInk())
+                      ?.addOnSuccessListener { r ->
+                          lastText = r.candidates.firstOrNull()?.text ?: ""
+                          preview.text = if (lastText.isEmpty()) "…" else lastText
+                      }
+              }
+
+              private fun insertText() {
+                  if (lastText.isBlank()) return
+                  val ok = TypeService.instance?.insert(lastText) == true
+                  if (!ok) {
+                      val cm = getSystemService(ClipboardManager::class.java)
+                      cm.setPrimaryClip(ClipData.newPlainText("text", lastText))
+                      Toast.makeText(this, "تم النسخ — الصق النص (فعّل خدمة الإدخال للإدراج المباشر)", Toast.LENGTH_LONG).show()
+                  }
+                  clearAll()
+              }
+
+              private fun clearAll() {
+                  h.removeCallbacks(recognizeRun)
+                  ink.clear(); lastText = ""; preview.text = "اكتب بيدك هنا…"
+              }
+
+              override fun onDestroy() {
+                  h.removeCallbacks(recognizeRun)
+                  try { wm.removeView(root) } catch (_: Exception) {}
+                  recognizer?.close()
+                  super.onDestroy()
+              }
+          }
+          ENDOFFILE
+          mkdir -p app/src/main/java/com/arabicboard
+          cat > app/src/main/java/com/arabicboard/MainActivity.kt <<'ENDOFFILE'
+          package com.arabicboard
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  val d = resources.displayMetrics.density
+                  fun b(t: String, c: String, f: () -> Unit) = Button(this).apply {
+                      text = t; textSize = 17f; setTextColor(Color.WHITE); setBackgroundColor(Color.parseColor(c))
+                      setOnClickListener { f() }
+                      layoutParams = LinearLayout.LayoutParams(-1, (56 * d).toInt()).apply { topMargin = (14 * d).toInt() }
+                  }
+                  val l = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                      setPadding((24 * d).toInt(), 0, (24 * d).toInt(), 0); setBackgroundColor(Color.WHITE)
+                  }
+                  l.addView(TextView(this).apply {
+                      text = "سبورة عربية عائمة"; textSize = 26f; gravity = Gravity.CENTER; setTextColor(Color.parseColor("#1E40AF"))
+                  })
+                  l.addView(b("١) السماح بالظهور فوق التطبيقات", "#1E40AF") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  })
+                  l.addView(b("٢) تفعيل خدمة الإدراج في مربع النص", "#7C3AED") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  l.addView(b("٣) تشغيل السبورة", "#16A34A") {
+                      if (!Settings.canDrawOverlays(this)) Toast.makeText(this, "فعّل الخطوة 1 أولًا", Toast.LENGTH_SHORT).show()
+                      else { startForegroundService(Intent(this, OverlayService::class.java)); moveTaskToBack(true) }
+                  })
+                  setContentView(l)
+              }
+          }
+          ENDOFFILE
+          [ -f arabic.ttf ] && cp arabic.ttf app/src/main/assets/fonts/arabic.ttf || true
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArabicWhiteboard-apk
+          path: app/build/outputs/apk/debug/*.apk
